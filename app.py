@@ -6,7 +6,7 @@ import certifi
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from slack_sdk import WebClient
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 from dotenv import load_dotenv
 import sqlite3
@@ -14,14 +14,14 @@ from sqlite3 import Error
 import json
 import threading
 import time
-from datetime import datetime, timedelta
 from slack_sdk.errors import SlackApiError
 from google.api_core.exceptions import ResourceExhausted
 from contextlib import contextmanager
 import sys
 import atexit
 import html
-
+import asana
+from asana.rest import ApiException
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 load_dotenv()
@@ -30,6 +30,16 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
+ASANA_TOKEN = os.getenv("ASANA_TOKEN")
+
+# Asana configuration
+configuration = asana.Configuration()
+configuration.access_token = ASANA_TOKEN
+asana_api_client = asana.ApiClient(configuration)
+
+# Create API instances for each resource you want to use
+tasks_api = asana.TasksApi(asana_api_client)
+projects_api = asana.ProjectsApi(asana_api_client)
 
 # Global variables
 SEARCH_LIMIT = 3000 # Max messages to search
@@ -43,9 +53,27 @@ MESSAGE_LIMIT = 500 # Limits the number of messages to use in context in a priva
 SEARCH_TRIGGERS = ["search", "find", "look", "show", "gather", "get"]
 ENABLE_MENTION_INJECTION = True
 
+BOT_PERSONALITY_PROMPT = (
+    "You are Clip Eastwood, a Slack-based creative assistant with a gruff, witty, and cowboy flair. Your top priority is to follow user instructions quickly and accurately. Be helpful, insightful, thorough in your responses. You are capable of creative tasks and effective business communications (lists, memos, letters, summaries, newsletters, blogs, articles, and multi-paragraph write-ups and summaries). Respond in markdown. "
+    "IMPORTANT: MAINTAIN YOUR SIGNATURE STYLE ONLY IN COMMUNICATING WITH USERS (greetings, sign-offs, etc.), BUT DO NOT INCLUDE COWBOY OR PERSONALITY STYLE IN THE CONTENT OUTPUT ITSELF. THE CONTENT OUTPUT (SUMMARIES, LISTS, ETC.) SHOULD BE PROFESSIONAL, CLEAR, AND NEUTRAL UNLESS THE USER EXPLICITLY REQUESTS OTHERWISE. "
+    "Instructions: \n"
+    "- Use the recent messages to understand any names, tasks, or references. \n"
+    "- Do NOT repeat or summarize the context block—just use it to inform your reply. \n"
+    "- Avoid repeating questions the user already answered. \n"
+    "- Be warm and human, but don't delay the task. \n"
+    "- Use wit and charm only to enhance clarity or delight, not to stall. \n"
+    "If you are unsure, always err on the side of neutral, professional output."
+)
+
 # Initialize Slack clients
 app = App(token=SLACK_BOT_TOKEN)
 client = WebClient(token=SLACK_BOT_TOKEN)
+
+def human_time(iso_str):
+    try:
+        return datetime.strptime(iso_str, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%B %d, %Y at %I:%M %p")
+    except Exception:
+        return iso_str or "N/A"
 
 # Cache the bot's user ID once
 try:
@@ -97,15 +125,20 @@ def db_connection():
     finally:
         conn.close()
 
+def get_default_workspace_id():
+    workspaces_api = asana.WorkspacesApi(asana_api_client)
+    workspaces = list(workspaces_api.get_workspaces({}))
+    if not workspaces:
+        raise Exception("No Asana workspaces available for your token.")
+    return workspaces[0]['gid']
+
 def init_db():
-    """Initialize SQLite database with messages table"""
+    """Initialize SQLite database with messages table and related tables."""
     with db_connection() as conn:
         c = conn.cursor()
-        
         # Enable Write-Ahead Logging (WAL) and Optimize PRAGMAs
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
-       
         # Main messages table
         c.execute('''CREATE TABLE IF NOT EXISTS messages
         (ts TEXT PRIMARY KEY,
@@ -120,16 +153,33 @@ def init_db():
         permalink TEXT,
         is_bot BOOLEAN,
         deleted BOOLEAN DEFAULT FALSE)''')
-        
         # Last seen timestamps per channel
         c.execute('''CREATE TABLE IF NOT EXISTS last_seen
         (channel_id TEXT PRIMARY KEY,
         last_ts TEXT)''')
-        
         # Whether messages have been responded to
         c.execute('''CREATE TABLE IF NOT EXISTS responded_messages
         (ts TEXT PRIMARY KEY)''')
         conn.commit()
+        # Asana tasks
+        c.execute('''CREATE TABLE IF NOT EXISTS asana_tasks (
+        gid TEXT PRIMARY KEY,
+        name TEXT,
+        notes TEXT,
+        assignee TEXT,
+        completed BOOLEAN,
+        due_on TEXT,
+        project_id TEXT,
+        modified_at TEXT,
+        custom_fields_json TEXT)''')
+        # Asana projects
+        c.execute('''CREATE TABLE IF NOT EXISTS asana_projects (
+        gid TEXT PRIMARY KEY,
+        name TEXT,
+        notes TEXT,
+        created_at TEXT,
+        modified_at TEXT,
+        custom_fields_json TEXT)''')
 
 init_db()
 
@@ -183,6 +233,107 @@ def get_channel_and_thread_context(client, channel_id, limit=50, logger=None):
         pass
     
     return all_msgs[-limit:]  # Return most recent messages
+
+def get_asana_context_blocks(keywords=None):
+    with db_connection() as conn:
+        c = conn.cursor()
+        tasks = [dict(row) for row in c.execute("SELECT * FROM asana_tasks").fetchall()]
+        projects = [dict(row) for row in c.execute("SELECT * FROM asana_projects").fetchall()]
+
+    from collections import defaultdict
+    project_tasks = defaultdict(list)
+    for task in tasks:
+        project_id = task.get("project_id")
+        task_str = f"- {task.get('name')} [Due: {human_time(task.get('due_on'))} | Completed: {bool(task.get('completed'))} | Last Updated: {human_time(task.get('modified_at'))}]"
+        notes = task.get("notes", "")
+        clean_notes = re.sub(r'https?://\S+', '[link removed]', notes)
+        clean_notes = re.sub(r'\s+', ' ', clean_notes).strip()
+        if clean_notes:
+            task_str += f"\n  Notes: {clean_notes[:1000]}..."
+        project_tasks[project_id].append(task_str)
+
+    # If keywords provided, filter projects
+    if keywords:
+        keywords_lower = [k.lower() for k in keywords]
+        projects = [
+            p for p in projects
+            if any(k in (p.get("name", "").lower() + " " + p.get("notes", "").lower()) for k in keywords_lower)
+        ]
+
+    formatted_blocks = []
+    for project in projects:
+        pid = project.get("gid")
+        header = f"*Project: {project.get('name')}*\nLast Updated: {human_time(project.get('modified_at'))}"
+        notes = f"Notes: {project.get('notes')[:1000]}." if project.get("notes") else ""
+        tasks_formatted = "\n".join(project_tasks.get(pid, ["(No associated tasks found)"]))
+        block = f"{header}\n{notes}\n\nAssociated Tasks:\n{tasks_formatted}"
+        formatted_blocks.append(block)
+
+    if not formatted_blocks:
+        return []
+
+    return [f"### Asana Project & Task Context\n\n" + "\n\n".join(formatted_blocks[:50])]  # Limit for safety
+
+def sync_asana_data_once():
+    """
+    Run a one-time sync of Asana projects and tasks into the local database.
+    """
+    logger.info("[ASANA SYNC] Starting Asana sync pass.")
+    try:
+        workspaces_api = asana.WorkspacesApi(asana_api_client)
+        workspace_gid = list(workspaces_api.get_workspaces({}))[0]['gid']
+
+        projects = projects_api.get_projects_for_workspace(
+            workspace_gid,
+            {"opt_fields": "gid,name,notes,created_at,modified_at,custom_fields"}
+        )
+
+        with db_connection() as conn:
+            c = conn.cursor()
+
+            # Insert projects
+            for project in projects:
+                custom_fields_json = json.dumps(project.get("custom_fields", []))
+                c.execute('''
+                    INSERT OR REPLACE INTO asana_projects
+                    (gid, name, notes, created_at, modified_at, custom_fields_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    project.get("gid"),
+                    project.get("name"),
+                    project.get("notes"),
+                    project.get("created_at"),
+                    project.get("modified_at"),
+                    custom_fields_json
+                ))
+
+                # Fetch tasks for this project
+                tasks = tasks_api.get_tasks_for_project(
+                    project.get("gid"),
+                    {"opt_fields": "gid,name,notes,assignee,completed,due_on,projects,modified_at,custom_fields"}
+                )
+                for task in tasks:
+                    assignee_gid = task["assignee"]["gid"] if task.get("assignee") else None
+                    custom_fields_json = json.dumps(task.get("custom_fields", []))
+                    c.execute('''
+                        INSERT OR REPLACE INTO asana_tasks
+                        (gid, name, notes, assignee, completed, due_on, project_id, modified_at, custom_fields_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        task.get("gid"),
+                        task.get("name"),
+                        task.get("notes"),
+                        assignee_gid,
+                        int(task.get("completed", False)),
+                        task.get("due_on"),
+                        project.get("gid"),
+                        task.get("modified_at"),
+                        custom_fields_json
+                    ))
+            conn.commit()
+        logger.info("[ASANA SYNC] Completed Asana sync.")
+    except Exception as e:
+        logger.error(f"[ASANA SYNC] Error during sync: {e}", exc_info=True)
 
 user_name_cache = {}
 channel_name_cache = {}
@@ -405,7 +556,10 @@ def inject_mentions(text):
     return text
 
 def is_search_request(message):
-    return any(trigger in message.lower() for trigger in SEARCH_TRIGGERS) if message else False
+    if not message:
+        return False
+    message_lower = message.lower()
+    return any(message_lower.split().count(trigger) > 0 for trigger in SEARCH_TRIGGERS)
 
 def extract_search_terms_and_instruction(message, logger=None):
 
@@ -574,6 +728,10 @@ def backfill_and_process_mentions():
                     break
 
         logger.info("[BACKFILL] Backfill complete")
+
+        # Asana sync
+        logger.info("[BACKFILL] Starting one-time Asana sync after backfill.")
+        sync_asana_data_once()
 
     except Exception as e:
         logger.error(f"[BACKFILL] Critical error: {e}", exc_info=True)
@@ -865,8 +1023,7 @@ def format_source_for_thread(msg, idx=None):
             f"\"{text_preview}\" {link}")
 
 def handle_search_request(
-    keywords, instruction, user_id, channel_id, say, client, logger, source="command", super_search=False
-):
+    keywords, instruction, user_id, channel_id, say, client, logger, source="command", super_search=False, extra_chunks=None):
     """
     Handles both standard and super search requests.
     - If super_search: searches ALL messages, no keyword filtering, no chunk limit.
@@ -897,7 +1054,19 @@ def handle_search_request(
     sources = results
 
     try:
-        for i, chunk in enumerate(chunk_list(results, chunk_size)):
+        # 1. Create context chunks from Slack messages
+        slack_chunks = [ [format_message_for_context(r) for r in chunk] for chunk in chunk_list(results, chunk_size) ]
+
+        # 2. Add extra chunks (e.g. Asana context), each must be a list of strings
+        all_chunks = slack_chunks
+
+        if extra_chunks:
+            if isinstance(extra_chunks[0], str):  # ensure it's a list of strings inside a list
+                all_chunks.append(extra_chunks)
+            else:
+                all_chunks.extend(extra_chunks)
+        
+        for i, chunk in enumerate(all_chunks):
             if i >= max_chunks:
                 summaries.append("Too many results. Please narrow your search.")
                 break
@@ -906,9 +1075,12 @@ def handle_search_request(
                 f"[SEARCH][CHUNK] Summarizing chunk {i+1}/"
                 f"{'∞' if super_search else max_chunks} with {len(chunk)} messages."
             )
-            context_snippets = [format_message_for_context(r) for r in chunk]
+            # Only call format_message_for_context on dicts; use string as-is for asana context
+            context_snippets = [
+                format_message_for_context(r) if isinstance(r, dict) else r
+                for r in chunk
+            ]
             prompt = (
-                f"You are Clip Eastwood, a Slack-based creative assistant. "
                 f"Below are Slack messages{' from our entire history' if super_search else f' about {', '.join(keywords)}'}. "
                 f"{instruction}\n\n"
                 f"{'-'*20}\n"
@@ -927,7 +1099,8 @@ def handle_search_request(
     if len(summaries) > 1:
         logger.info(f"[SEARCH][FINAL] Summarizing {len(summaries)} chunk summaries into final result.")
         final_prompt = (
-            f"Summarize the following summaries into a single cohesive answer:\n\n"
+            f"{BOT_PERSONALITY_PROMPT}\n\n"
+            f"{instruction}:\n\n"
             f"{'-'*20}\n"
             f"{chr(10).join(summaries)}"
         )
@@ -942,7 +1115,6 @@ def handle_search_request(
     else:
         final_summary = summaries[0] if summaries else "No summary available."
 
-    sources_to_show = sources[:MAX_SOURCES]
     sources_note = ""
     if len(sources) > MAX_SOURCES:
         sources_note = f"_{len(sources)} sources found._"
@@ -954,7 +1126,7 @@ def handle_search_request(
     # Post summary with sources note
     context_header = (
         f"*Requestor:* <@{user_id}>\n"
-        f"*Search Type:* {'SUPER SEARCH' if super_search else 'Standard'}\n"
+        f"*Search Type:* {'Super Search' if super_search else 'Standard'}\n"
         f"*Keywords:* {', '.join(keywords) if keywords else '(all messages)'}\n"
         f"*Context:* {instruction}\n\n"
         f"{sources_note}\n\n"
@@ -965,6 +1137,87 @@ def handle_search_request(
         text=context_header + "\n" + format_for_slack(final_summary or ""),
     )
     parent_ts = summary_post["ts"]
+
+asana_chunks = get_asana_context_blocks()
+
+@app.command("/ai-asana-query")
+def handle_asana_query_command(ack, respond, command, say, logger, client):
+    ack()
+
+    instruction = command.get("text", "").strip()
+    user_id = command.get("user_id")
+    channel_id = command.get("channel_id")
+
+    if not instruction:
+        respond("Please include an instruction, like `/ai-asana-query what tasks are due soon?`")
+        return
+
+    logger.info(f"[AI ASANA QUERY] Received request from user {user_id} in channel {channel_id}: {instruction}")
+    respond(f"Querying Asana data and fulfilling your request to: '{instruction}'. This may take a moment...")
+
+    try:
+        logger.info("[AI ASANA QUERY] Connecting to database and retrieving records.")
+
+        # Step 1: Load and convert DB rows to plain dicts
+        with db_connection() as conn:
+            c = conn.cursor()
+            tasks = [dict(row) for row in c.execute("SELECT * FROM asana_tasks").fetchall()]
+            projects = [dict(row) for row in c.execute("SELECT * FROM asana_projects").fetchall()]
+        logger.info(f"[AI ASANA QUERY] Retrieved {len(projects)} projects and {len(tasks)} tasks.")
+
+        # Step 2: Group tasks by project
+        from collections import defaultdict
+        project_tasks = defaultdict(list)
+        for task in tasks:
+            project_id = task.get("project_id")
+            task_str = f"- {task.get('name')} [Due: {human_time(task.get('due_on'))} | Completed: {bool(task.get('completed'))} | Last Updated: {human_time(task.get('modified_at'))}]"
+            notes = task.get("notes", "")
+            clean_notes = re.sub(r'https?://\S+', '[link removed]', notes)  # remove URLs
+            clean_notes = re.sub(r'\s+', ' ', clean_notes).strip()
+            if clean_notes:
+                task_str += f"\n  Notes: {clean_notes[:1000]}..."
+            project_tasks[project_id].append(task_str)
+        logger.info("[AI ASANA QUERY] Grouped tasks by project.")
+
+        # Step 3: Format blocks per project
+        formatted_blocks = []
+        for project in projects:
+            pid = project.get("gid")
+            header = f"*Project: {project.get('name')}*\nLast Updated: {human_time(project.get('modified_at'))}"
+            notes = f"Notes: {project.get('notes')[:1000]}." if project.get("notes") else ""
+            tasks_formatted = "\n".join(project_tasks.get(pid, ["(No associated tasks found)"]))
+            block = f"{header}\n{notes}\n\nAssociated Tasks:\n{tasks_formatted}"
+            formatted_blocks.append(block)
+        logger.info("[AI ASANA QUERY] Assembled formatted blocks for prompt.")
+
+        # Step 4: Build AI prompt
+        prompt = (
+            f"You are Clip Eastwood, a Slack-based AI assistant. The user has asked:\n\n"
+            f"\"{instruction}\"\n\n"
+            f"Below is a structured list of Asana projects and their associated tasks. Please analyze this context and respond with insight and clarity.\n\n"
+            f"{'-'*40}\n\n"
+            + "\n\n".join(formatted_blocks[:100])  # Limit to 100 projects
+        )
+        logger.info("[AI ASANA QUERY] Prompt ready, sending to Gemini.")
+
+        # Step 5: Generate AI response
+        response_text = generate_response(prompt)
+        logger.info("[AI ASANA QUERY] Response generated successfully.")
+
+        formatted = format_for_slack(response_text)
+        
+        response_header = (
+        f"*Requestor:* <@{user_id}>\n"
+        f"*Search Type:* Asana Query\n"
+        f"*Request:* {instruction}\n\n"
+        f"_Reviewed {len(projects)} projects and {len(tasks)} tasks_\n\n"
+        )
+        full_response = response_header + formatted
+        say(full_response, channel=channel_id)
+
+    except Exception as e:
+        logger.error(f"[AI ASANA QUERY] Error processing request: {e}", exc_info=True)
+        say("Sorry, something went wrong while processing the Asana query.")
 
 @app.command("/ai-search")
 def handle_search_command(ack, respond, command, say, logger, client):
@@ -997,6 +1250,7 @@ def handle_search_command(ack, respond, command, say, logger, client):
         logger=logger,
         source="command",
         super_search=False,
+        extra_chunks=asana_chunks,
     )
 
 @app.command("/ai-super-search")
@@ -1010,7 +1264,7 @@ def handle_super_search_command(ack, respond, command, say, logger, client):
     instruction = text if text else "Summarize the findings"
 
     respond(
-        f"Running SUPER SEARCH across ALL messages. Instruction: '{instruction}'. This may take up to 10 minutes..."
+        f"Running Super Search across ALL messages. Instruction: '{instruction}'. This may take up to 10 minutes..."
     )
 
     handle_search_request(
@@ -1023,6 +1277,7 @@ def handle_super_search_command(ack, respond, command, say, logger, client):
         logger=logger,
         source="command",
         super_search=True,
+        extra_chunks=asana_chunks,
     )
 
 def search_messages_local_flat(limit=None, channel_id=None):
@@ -1110,6 +1365,7 @@ def handle_bot_interaction(event, say, client, logger):
         except Exception as e:
             logger.error(f"Failed to send ephemeral search message: {e}")
 
+        # Integrate Asana context into @mention-triggered searches
         handle_search_request(
             keywords=keywords,
             instruction=instruction,
@@ -1118,7 +1374,8 @@ def handle_bot_interaction(event, say, client, logger):
             say=say,
             client=client,
             logger=logger,
-            source="mention"
+            source="mention",
+            extra_chunks=asana_chunks  # <-- Pass Asana context here
         )
         return
 
@@ -1150,7 +1407,7 @@ def handle_bot_interaction(event, say, client, logger):
                     context_messages.append(f"[{timestamp}] {sender}: {msg['text']}")
                 except Exception as e:
                     logger.warning(f"[CONTEXT] Skipped message due to missing user: {e}")
-        
+
         context = {
             "primary_message": primary_message,
             "previous_messages": "\n".join(context_messages[-CHUNK_SIZE:])
@@ -1204,29 +1461,15 @@ def get_thread_and_context_messages(channel_id, thread_ts=None, limit=CHUNK_SIZE
 
 def build_context_prompt(context):
     """Prompt for context-rich user interactions (direct mentions, DMs)."""
-    return f"""You are Clip Eastwood, a Slack-based creative assistant with a gruff, witty, and cowboy flair. 
-    Your top priority is to follow user instructions quickly and accurately, using clarity and insight. 
-    Be helpful, insightful, thorough in your responses, and capable of creative tasks and effective business communications 
-    (lists, memos, letters, summaries, newsletters, blogs, articles, and multi-paragraph write-ups and summaries). 
-    Respond in markdown, and maintain your signature style only in communicating with users, not in content output. 
-    
-    Instructions: 
-    - Use the recent messages to understand any names, tasks, or references.
-    - Do NOT repeat or summarize the context block—just use it to inform your reply.
-    - Avoid repeating questions the user already answered.
-    - Be warm and human, but don't delay the task.
-    - Use wit and charm only to enhance clarity or delight, not to stall.
-    
-    User request:
-    
-    \"\"\"{context['primary_message']}\"\"\"
-    
-    Channel context:
-    
-    \"\"\"{context['previous_messages']}\"\"\"
-    
-    Respond clearly, confidently, and in a format that fits the request (lists, memos, letters, summaries, 
-    newsletters, blogs, articles, and multi-paragraph write-ups and summaries). Prioritize completion."""
+    return (
+        f"{BOT_PERSONALITY_PROMPT}\n\n"
+        f"User request:\n\n"
+        f'"""{context["primary_message"]}"""\n\n'
+        f"Channel context:\n\n"
+        f'"""{context["previous_messages"]}"""\n\n'
+        "Respond clearly, confidently, and in a format that fits the request (lists, memos, letters, summaries, "
+        "newsletters, blogs, articles, and multi-paragraph write-ups and summaries). Prioritize completion."
+    )
 
 def generate_response(prompt, safe=True, max_retries=2):
     """
@@ -1361,7 +1604,7 @@ stop_event = threading.Event()
 
 def main():
     # Register cleanup FIRST
-    atexit.register(lambda: print("[EXIT] Interrupted by user."))
+    atexit.register(lambda: print(" [EXIT] Interrupted by user."))
     
     # Start Bolt app in non-daemon thread
     bolt_thread = threading.Thread(
@@ -1373,7 +1616,7 @@ def main():
     # Start background tasks as daemon threads
     threading.Thread(target=join_all_channels, daemon=True).start()
     threading.Thread(target=periodic_backfill, daemon=True).start()
-    
+
     try:
         bolt_thread.join()  # Block until Bolt exits
     except KeyboardInterrupt:

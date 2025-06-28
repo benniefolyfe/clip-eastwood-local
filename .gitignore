@@ -2,4 +2,5 @@
 /.env
 /.gitattributes
 /Clip Eastwood Unresolved Items.docx
-/slack_messages.db
+/*.db*
+/.DS_Store
