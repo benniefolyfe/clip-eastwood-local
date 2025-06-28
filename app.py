@@ -21,7 +21,8 @@ import sys
 import atexit
 import html
 import asana
-from asana.rest import ApiException
+import requests
+import math
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 load_dotenv()
@@ -42,27 +43,20 @@ tasks_api = asana.TasksApi(asana_api_client)
 projects_api = asana.ProjectsApi(asana_api_client)
 
 # Global variables
-SEARCH_LIMIT = 3000 # Max messages to search
 CHUNK_SIZE = 500 # Messages per Gemini call
-DELAY_BETWEEN_CALLS = 10 # Seconds to wait between Gemini calls
-MAX_CHUNKS = 6 # Hard cap to avoid runaway loops
-SUPER_SEARCH_CHUNK_SIZE = 500
+DELAY_BETWEEN_CALLS = 0 # Seconds to wait between Gemini calls
 MAX_SOURCES = 10  # Adjust this number as needed
 BACKFILL_INTERVAL = 1800 # 30 minutes
 MESSAGE_LIMIT = 500 # Limits the number of messages to use in context in a private channel or DM
-SEARCH_TRIGGERS = ["search", "find", "look", "show", "gather", "get"]
 ENABLE_MENTION_INJECTION = True
-
+SEARCH_TRIGGERS = ["search", "find", "look", "show", "gather", "get"]
+GENERIC_STOPWORDS = {"project", "projects", "task", "tasks", "info", "information", "details", "summary", "summaries", "thing", "things", "item", "items", "topic", "topics"}
 BOT_PERSONALITY_PROMPT = (
-    "You are Clip Eastwood, a Slack-based creative assistant with a gruff, witty, and cowboy flair. Your top priority is to follow user instructions quickly and accurately. Be helpful, insightful, thorough in your responses. You are capable of creative tasks and effective business communications (lists, memos, letters, summaries, newsletters, blogs, articles, and multi-paragraph write-ups and summaries). Respond in markdown. "
-    "IMPORTANT: MAINTAIN YOUR SIGNATURE STYLE ONLY IN COMMUNICATING WITH USERS (greetings, sign-offs, etc.), BUT DO NOT INCLUDE COWBOY OR PERSONALITY STYLE IN THE CONTENT OUTPUT ITSELF. THE CONTENT OUTPUT (SUMMARIES, LISTS, ETC.) SHOULD BE PROFESSIONAL, CLEAR, AND NEUTRAL UNLESS THE USER EXPLICITLY REQUESTS OTHERWISE. "
-    "Instructions: \n"
-    "- Use the recent messages to understand any names, tasks, or references. \n"
-    "- Do NOT repeat or summarize the context block—just use it to inform your reply. \n"
-    "- Avoid repeating questions the user already answered. \n"
-    "- Be warm and human, but don't delay the task. \n"
-    "- Use wit and charm only to enhance clarity or delight, not to stall. \n"
-    "If you are unsure, always err on the side of neutral, professional output."
+    "You are Clip Eastwood, a Slack-based creative assistant with a gruff, witty, cowboy flair. "
+    "Greet and sign off in your signature style, but keep all summaries, lists, and business content professional and neutral unless the user requests otherwise. "
+    "Use recent messages only as context—do not repeat or summarize them directly. "
+    "Be helpful, concise, and insightful. Respond in markdown. "
+    "If unsure, err on the side of clarity and professionalism."
 )
 
 # Initialize Slack clients
@@ -196,7 +190,7 @@ def get_slack_entity(entity_type, entity_id, cache, fetch_fn):
     except Exception:
         return f"Unknown {entity_type.title()}"
 
-def get_channel_and_thread_context(client, channel_id, limit=50, logger=None):
+def get_channel_and_thread_context(client, channel_id, limit=500, logger=None):
     """
     Fetches main channel messages and all threaded replies, merged and sorted chronologically.
     """
@@ -272,7 +266,7 @@ def get_asana_context_blocks(keywords=None):
     if not formatted_blocks:
         return []
 
-    return [f"### Asana Project & Task Context\n\n" + "\n\n".join(formatted_blocks[:50])]  # Limit for safety
+    return [f"### Asana Project & Task Context\n\n" + "\n\n".join(formatted_blocks[:500])]  # Limit for safety
 
 def sync_asana_data_once():
     """
@@ -562,24 +556,26 @@ def is_search_request(message):
     return any(message_lower.split().count(trigger) > 0 for trigger in SEARCH_TRIGGERS)
 
 def extract_search_terms_and_instruction(message, logger=None):
-
     extraction_prompt = f"""Extract from this message:
     1. Keywords to search for (comma-separated)
-    2. Instruction for presenting results (after ";")
-    
+    2. Instruction for presenting results (after ";"). The instruction should include the user's requested action verb (e.g., 'provide', 'summarize', 'list', etc.) and be as complete as possible.
+
     Example response for "Find docs about AI and summarize key points"
-    
+
     "AI, documentation; summarize key points"
-    
+
     Message: "{message}
-    
+
     Response:"""
 
     try:
         response = generate_response(extraction_prompt, safe=True).strip()
         if ";" in response:
             terms_part, instruction = response.split(";", 1)
-            return [t.strip() for t in terms_part.split(",")], instruction.strip()
+            keywords = [t.strip() for t in terms_part.split(",")]
+            # Filter out generic stopwords
+            keywords = [k for k in keywords if k.lower() not in GENERIC_STOPWORDS and len(k) > 1]
+            return keywords, instruction.strip()
         else:
             return [response], "Summarize the findings"
     except Exception as e:
@@ -634,6 +630,26 @@ def message_exists(ts, channel_id):
         c = conn.cursor()
         c.execute("SELECT 1 FROM messages WHERE ts=? AND channel_id=?", (ts, channel_id))
         return c.fetchone() is not None
+
+def count_messages(keywords=None):
+    with db_connection() as conn:
+        c = conn.cursor()
+        if keywords:
+            query = "SELECT COUNT(*) FROM messages WHERE deleted = 0 AND (" + " OR ".join(["text LIKE ?"] * len(keywords)) + ")"
+            params = [f'%{term}%' for term in keywords]
+            c.execute(query, params)
+        else:
+            c.execute("SELECT COUNT(*) FROM messages WHERE deleted = 0")
+        return c.fetchone()[0]
+
+def count_asana_projects_and_tasks():
+    with db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM asana_projects")
+        projects = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM asana_tasks")
+        tasks = c.fetchone()[0]
+    return projects, tasks
 
 def periodic_backfill(interval=BACKFILL_INTERVAL):
     """Periodic backfill scheduler with auto-vacuum and null entry cleanup"""
@@ -803,8 +819,6 @@ def handle_dm_message(event, say, client, logger):
     Responds to every message in a DM using context from the DM via Slack API.
     """
     channel_id = event.get("channel")
-    thread_ts = event.get("thread_ts")
-    message_ts = event.get("ts")
     text = event.get("text", "")
 
     try:
@@ -947,7 +961,7 @@ def handle_app_mention(event, say, client, logger):
     bot_id = event.get("bot_id")
     channel_id = event.get("channel")
 
-    # 🛑 Prevent the bot from responding to its own messages
+    # Prevent the bot from responding to its own messages
     if user == BOT_USER_ID:
         logger.info(f"[MENTION] Skipped responding to self-mention at ts={ts}")
         return
@@ -1023,107 +1037,86 @@ def format_source_for_thread(msg, idx=None):
             f"\"{text_preview}\" {link}")
 
 def handle_search_request(
-    keywords, instruction, user_id, channel_id, say, client, logger, source="command", super_search=False, extra_chunks=None):
-    """
-    Handles both standard and super search requests.
-    - If super_search: searches ALL messages, no keyword filtering, no chunk limit.
-    - Otherwise: standard search with keywords and chunk limit.
-    """
+    keywords, instruction, user_id, channel_id, say, client, logger,
+    source="command", super_search=False, notice_ts=None
+):
     logger.info(
         f"[SEARCH][{source.upper()}] Handling request - "
         f"Keywords: {keywords} | Instruction: {instruction} | SuperSearch: {super_search}"
     )
 
+    # Dynamically get Asana context for these keywords
+    asana_context = get_asana_context_blocks(keywords) if keywords else []
+
     if super_search:
-        # Fetch ALL messages, no keyword filtering, no limit
         raw_results = search_messages_local_flat(limit=None)
-        chunk_size = SUPER_SEARCH_CHUNK_SIZE
-        max_chunks = float('inf')  # No artificial chunk limit
     else:
-        raw_results = search_messages_across_channels(keywords, logger=logger, search_limit=SEARCH_LIMIT)
-        chunk_size = CHUNK_SIZE
-        max_chunks = MAX_CHUNKS
+        raw_results = search_messages_across_channels(
+            keywords, logger=logger
+        )
 
     results = filter_search_messages(raw_results)
 
-    if not results:
-        say(f"No messages found for: {', '.join(keywords) if keywords else 'all messages'}", channel=channel_id)
+    if not results and not asana_context:
+        say(f"No messages or Asana projects found for: {', '.join(keywords) if keywords else 'all messages'}", channel=channel_id)
         return
 
-    summaries = []
     sources = results
+    slack_chunks = [
+        [format_message_for_context(r) for r in chunk]
+        for chunk in chunk_list(results, CHUNK_SIZE)
+    ]
 
-    try:
-        # 1. Create context chunks from Slack messages
-        slack_chunks = [ [format_message_for_context(r) for r in chunk] for chunk in chunk_list(results, chunk_size) ]
+    all_chunks = slack_chunks.copy()
+    if asana_context:
+        all_chunks.append(asana_context)
 
-        # 2. Add extra chunks (e.g. Asana context), each must be a list of strings
-        all_chunks = slack_chunks
+    all_snippets = [s for chunk in all_chunks for s in chunk]
 
-        if extra_chunks:
-            if isinstance(extra_chunks[0], str):  # ensure it's a list of strings inside a list
-                all_chunks.append(extra_chunks)
-            else:
-                all_chunks.extend(extra_chunks)
-        
+    # Calculate total number of chunks for logging
+    num_messages = len(results)
+    total_chunks = math.ceil(num_messages / CHUNK_SIZE) if num_messages else 1
+
+    prompt_template = (
+        f"{BOT_PERSONALITY_PROMPT}\n\n"
+        f"User request:\n"
+        f"\"\"\"{{instruction}}\"\"\"\n\n"
+        f"Context from Slack messages and other sources:\n"
+        f"\"\"\"{{context_block}}\"\"\"\n\n"
+        "Using only the context above, craft a direct, complete, and helpful answer to the user's request. "
+        "Do not critique or summarize the context block itself. Do not refer to the context block directly. "
+        "Respond as if you are answering the user directly."
+    )
+
+    if len(all_snippets) > CHUNK_SIZE * total_chunks:
+        logger.warning("[SEARCH] Result too large for full summarization, falling back to chunk summaries.")
+        summaries = []
         for i, chunk in enumerate(all_chunks):
-            if i >= max_chunks:
-                summaries.append("Too many results. Please narrow your search.")
-                break
-
             logger.info(
-                f"[SEARCH][CHUNK] Summarizing chunk {i+1}/"
-                f"{'∞' if super_search else max_chunks} with {len(chunk)} messages."
+                f"[SEARCH][CHUNK] Summarizing chunk {i+1}/{total_chunks} with {len(chunk)} messages."
             )
-            # Only call format_message_for_context on dicts; use string as-is for asana context
-            context_snippets = [
-                format_message_for_context(r) if isinstance(r, dict) else r
-                for r in chunk
-            ]
-            prompt = (
-                f"Below are Slack messages{' from our entire history' if super_search else f' about {', '.join(keywords)}'}. "
-                f"{instruction}\n\n"
-                f"{'-'*20}\n"
-                f"{chr(10).join(context_snippets)}"
+            chunk_prompt = prompt_template.format(
+                instruction=instruction,
+                context_block=chr(10).join(chunk)
             )
-            summary = generate_response(prompt, safe=True)
+            summary = generate_response(chunk_prompt, safe=True)
             summaries.append(summary)
             time.sleep(DELAY_BETWEEN_CALLS)
-    except ResourceExhausted:
-        say(
-            "Sorry, the AI service is temporarily unavailable due to quota limits. Please try again later.",
-            channel=channel_id,
+
+        final_prompt = prompt_template.format(
+            instruction=instruction,
+            context_block=chr(10).join(summaries)
         )
-        return
-
-    if len(summaries) > 1:
-        logger.info(f"[SEARCH][FINAL] Summarizing {len(summaries)} chunk summaries into final result.")
-        final_prompt = (
-            f"{BOT_PERSONALITY_PROMPT}\n\n"
-            f"{instruction}:\n\n"
-            f"{'-'*20}\n"
-            f"{chr(10).join(summaries)}"
+        final_summary = generate_response(final_prompt, safe=True)
+    else:
+        prompt = prompt_template.format(
+            instruction=instruction,
+            context_block=chr(10).join(all_snippets)
         )
-        try:
-            final_summary = generate_response(final_prompt, safe=True)
-        except ResourceExhausted:
-            say(
-                "Sorry, the AI service is temporarily unavailable due to quota limits. Please try again later.",
-                channel=channel_id,
-            )
-            return
-    else:
-        final_summary = summaries[0] if summaries else "No summary available."
+        final_summary = generate_response(prompt, safe=True)
 
-    sources_note = ""
-    if len(sources) > MAX_SOURCES:
-        sources_note = f"_{len(sources)} sources found._"
-    elif sources:
-        sources_note = f"_{len(sources)} sources found._"
-    else:
-        sources_note = "_No relevant sources found._"
+    sources_note = f"_{len(sources)} sources found._" if sources else "_No relevant sources found._"
 
-    # Post summary with sources note
     context_header = (
         f"*Requestor:* <@{user_id}>\n"
         f"*Search Type:* {'Super Search' if super_search else 'Standard'}\n"
@@ -1138,22 +1131,141 @@ def handle_search_request(
     )
     parent_ts = summary_post["ts"]
 
-asana_chunks = get_asana_context_blocks()
+    # Remove the announcement message if present
+    if notice_ts:
+        try:
+            client.chat_delete(channel=channel_id, ts=notice_ts)
+        except Exception as e:
+            logger.warning(f"Failed to delete public notice message: {e}")
+
+
+@app.command("/dev-clean-sweep")
+def handle_dev_channels_delete_recent(ack, respond, command, client, logger):
+    ack()
+    try:
+        # Fetch all public and private channels, paginated
+        channels = []
+        cursor = None
+        while True:
+            resp = client.conversations_list(types="public_channel,private_channel", limit=1000, cursor=cursor)
+            channels.extend(resp["channels"])
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        # Only channels starting with dev and bot is a member
+        dev_channels = [c for c in channels if c["name"].startswith("dev") and c.get("is_member", False)]
+        logger.info(f"dev_channels found: {[c['name'] for c in dev_channels]}")
+        if not dev_channels:
+            respond("No channels found starting with 'dev'.")
+            return
+
+        deleted = []
+        for channel in dev_channels:
+            channel_id = channel["id"]
+            total_deleted = 0
+            total_skipped = 0
+            cursor = None
+            while True:
+                try:
+                    resp = client.conversations_history(channel=channel_id, limit=1000, cursor=cursor)
+                    messages = resp.get("messages", [])
+                    if not messages:
+                        break
+                    for msg in messages:
+                        ts = msg.get("ts")
+                        # Delete threaded replies first, if any
+                        if msg.get("reply_count", 0) > 0 and msg.get("thread_ts"):
+                            thread_cursor = None
+                            while True:
+                                try:
+                                    thread_resp = client.conversations_replies(
+                                        channel=channel_id,
+                                        ts=msg["thread_ts"],
+                                        cursor=thread_cursor,
+                                        limit=200
+                                    )
+                                    replies = thread_resp.get("messages", [])[1:]  # skip parent
+                                    for reply in replies:
+                                        reply_ts = reply.get("ts")
+                                        while True:
+                                            try:
+                                                client.chat_delete(channel=channel_id, ts=reply_ts)
+                                                total_deleted += 1
+                                                break
+                                            except SlackApiError as e:
+                                                error = e.response["error"]
+                                                if error == "ratelimited":
+                                                    retry_after = int(e.response.headers.get("Retry-After", 30))
+                                                    logger.warning(f"Rate limited. Sleeping for {retry_after} seconds...")
+                                                    time.sleep(retry_after)
+                                                    continue
+                                                else:
+                                                    logger.warning(f"Could not delete thread reply {reply_ts} in {channel['name']}: {error}")
+                                                    total_skipped += 1
+                                                    break
+                                            except Exception as e:
+                                                logger.warning(f"Could not delete thread reply {reply_ts} in {channel['name']}: {e}")
+                                                total_skipped += 1
+                                                break
+                                    thread_cursor = thread_resp.get("response_metadata", {}).get("next_cursor")
+                                    if not thread_cursor:
+                                        break
+                                except Exception as e:
+                                    logger.warning(f"Failed to fetch/delete thread replies in {channel['name']}: {e}")
+                                    break
+                        # Delete the parent/top-level message
+                        while True:
+                            try:
+                                client.chat_delete(channel=channel_id, ts=ts)
+                                total_deleted += 1
+                                break
+                            except SlackApiError as e:
+                                error = e.response["error"]
+                                if error == "ratelimited":
+                                    retry_after = int(e.response.headers.get("Retry-After", 30))
+                                    logger.warning(f"Rate limited. Sleeping for {retry_after} seconds...")
+                                    time.sleep(retry_after)
+                                    continue
+                                else:
+                                    logger.warning(f"Could not delete message {ts} in {channel['name']}: {error}")
+                                    total_skipped += 1
+                                    break
+                            except Exception as e:
+                                logger.warning(f"Could not delete message {ts} in {channel['name']}: {e}")
+                                total_skipped += 1
+                                break
+                    cursor = resp.get("response_metadata", {}).get("next_cursor")
+                    if not cursor:
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed to fetch/delete in {channel['name']}: {e}")
+                    break
+            deleted.append(f"{channel['name']} (deleted: {total_deleted}, skipped: {total_skipped})")
+        respond(
+            f"Delete complete. Results:\n" +
+            "\n".join(deleted)
+        )
+    except Exception as e:
+        logger.error(f"Error deleting all dev messages: {e}", exc_info=True)
+        respond("An error occurred while deleting messages.")
 
 @app.command("/ai-asana-query")
 def handle_asana_query_command(ack, respond, command, say, logger, client):
     ack()
-
     instruction = command.get("text", "").strip()
     user_id = command.get("user_id")
     channel_id = command.get("channel_id")
 
     if not instruction:
-        respond("Please include an instruction, like `/ai-asana-query what tasks are due soon?`")
+        say(f":warning: <@{user_id}> Please include an instruction, like `/ai-asana-query what tasks are due soon?`")
         return
 
+    say(
+        f":clipboard: <@{user_id}> requested an Asana query: _'{instruction}'_. This may take a moment. Results will be posted here."
+    )
+
     logger.info(f"[AI ASANA QUERY] Received request from user {user_id} in channel {channel_id}: {instruction}")
-    respond(f"Querying Asana data and fulfilling your request to: '{instruction}'. This may take a moment...")
 
     try:
         logger.info("[AI ASANA QUERY] Connecting to database and retrieving records.")
@@ -1192,8 +1304,8 @@ def handle_asana_query_command(ack, respond, command, say, logger, client):
 
         # Step 4: Build AI prompt
         prompt = (
-            f"You are Clip Eastwood, a Slack-based AI assistant. The user has asked:\n\n"
-            f"\"{instruction}\"\n\n"
+            f"The user has asked: \"{instruction}\"\n\n"
+            f"{BOT_PERSONALITY_PROMPT}\n\n"
             f"Below is a structured list of Asana projects and their associated tasks. Please analyze this context and respond with insight and clarity.\n\n"
             f"{'-'*40}\n\n"
             + "\n\n".join(formatted_blocks[:100])  # Limit to 100 projects
@@ -1235,10 +1347,20 @@ def handle_search_command(ack, respond, command, say, logger, client):
 
     keywords = [t.strip() for t in terms_part.split(",") if t.strip()]
 
-    respond(
-        f"Searching for {', '.join(keywords)} across channels and fulfilling your request to '{instruction}'. "
-        f"This may take a few minutes..."
+    # Count messages, projects, and tasks
+    num_messages = count_messages(keywords)
+    num_projects, num_tasks = count_asana_projects_and_tasks()
+    total_sources = num_messages + num_projects + num_tasks
+
+    # Post a public notice and capture the ts
+    notice = client.chat_postMessage(
+        channel=channel_id,
+        text=(
+            f":mag: <@{user_id}> requested a search for *{', '.join(keywords) if keywords else '(all messages)'}* "
+            f"with instruction: _'{instruction}'_. Searching {num_messages} messages, {num_projects} Asana projects, and {num_tasks} Asana tasks. ({total_sources} total sources). This may take a few minutes. Results will be posted here."
+        )
     )
+    notice_ts = notice["ts"]
 
     handle_search_request(
         keywords=keywords,
@@ -1250,8 +1372,13 @@ def handle_search_command(ack, respond, command, say, logger, client):
         logger=logger,
         source="command",
         super_search=False,
-        extra_chunks=asana_chunks,
     )
+    
+    # After posting the final result, delete the notice
+    try:
+        client.chat_delete(channel=channel_id, ts=notice_ts)
+    except Exception as e:
+        logger.warning(f"Failed to delete public notice message: {e}")
 
 @app.command("/ai-super-search")
 def handle_super_search_command(ack, respond, command, say, logger, client):
@@ -1260,15 +1387,19 @@ def handle_super_search_command(ack, respond, command, say, logger, client):
     user_id = command.get("user_id")
     channel_id = command.get("channel_id")
 
-    # For super search, treat the full text as instruction (no keywords)
     instruction = text if text else "Summarize the findings"
 
-    respond(
-        f"Running Super Search across ALL messages. Instruction: '{instruction}'. This may take up to 10 minutes..."
+    # Count all messages, projects, and tasks
+    num_messages = count_messages()
+    num_projects, num_tasks = count_asana_projects_and_tasks()
+    total_sources = num_messages + num_projects + num_tasks
+
+    say(
+        f":mag: <@{user_id}> requested a *Super Search* with instruction: _'{instruction}'_. Searching {num_messages} messages, {num_projects} Asana projects, and {num_tasks} Asana tasks. ({total_sources} total sources). This may take up to 5 minutes. Results will be posted here."
     )
 
     handle_search_request(
-        keywords=[],  # No keywords for super search
+        keywords=[],
         instruction=instruction,
         user_id=user_id,
         channel_id=channel_id,
@@ -1277,7 +1408,6 @@ def handle_super_search_command(ack, respond, command, say, logger, client):
         logger=logger,
         source="command",
         super_search=True,
-        extra_chunks=asana_chunks,
     )
 
 def search_messages_local_flat(limit=None, channel_id=None):
@@ -1302,7 +1432,7 @@ def search_messages_local_flat(limit=None, channel_id=None):
         logger.error(f"[DB] Search error: {e}", exc_info=True)
         return []
 
-def search_messages_across_channels(search_terms, logger=None, search_limit=None):
+def search_messages_across_channels(search_terms, logger=None):
     """
     Search for messages containing any of the search terms (OR logic).
     Returns a list of relevant messages with full metadata.
@@ -1316,9 +1446,6 @@ def search_messages_across_channels(search_terms, logger=None, search_limit=None
                      " OR ".join(["text LIKE ?" for _ in search_terms]) +
                      ") ORDER BY ts DESC")
             params = [f'%{term}%' for term in search_terms]
-            if search_limit:
-                query += ' LIMIT ?'
-                params.append(search_limit)
             c.execute(query, params)
             rows = c.fetchall()
             results = [dict(row) for row in rows]
@@ -1353,19 +1480,25 @@ def handle_bot_interaction(event, say, client, logger):
     if is_search_request(message_text):
         keywords, instruction = extract_search_terms_and_instruction(message_text, logger)
 
-        # Send ephemeral "searching" message to the user
-        try:
-            client.chat_postEphemeral(
-                channel=channel_id,
-                user=user_id,
-                text=(
-                    f"Searching for {', '.join(keywords)} across channels and fulfilling your request to '{instruction}'. This may take a few minutes..."
-                ),
-            )
-        except Exception as e:
-            logger.error(f"Failed to send ephemeral search message: {e}")
+        # Count messages, projects, and tasks
+        num_messages = count_messages(keywords)
+        num_projects, num_tasks = count_asana_projects_and_tasks()
+        total_sources = num_messages + num_projects + num_tasks
 
-        # Integrate Asana context into @mention-triggered searches
+        # Send "searching" message to the channel (public)
+        try:
+            notice = client.chat_postMessage(
+                channel=channel_id,
+                text=(
+                    f":mag: <@{user_id}> requested a search for *{', '.join(keywords) if keywords else '(all messages)'}* "
+                    f"with instruction: _'{instruction}'_. Searching {num_messages} messages, {num_projects} Asana projects, and {num_tasks} Asana tasks ({total_sources} total sources). This may take a few minutes. Results will be posted here."
+                )
+            )
+            notice_ts = notice["ts"]
+        except Exception as e:
+            logger.error(f"Failed to send search message: {e}")
+            notice_ts = None
+
         handle_search_request(
             keywords=keywords,
             instruction=instruction,
@@ -1375,7 +1508,7 @@ def handle_bot_interaction(event, say, client, logger):
             client=client,
             logger=logger,
             source="mention",
-            extra_chunks=asana_chunks  # <-- Pass Asana context here
+            notice_ts=notice_ts,  # Pass the ts
         )
         return
 
@@ -1467,8 +1600,7 @@ def build_context_prompt(context):
         f'"""{context["primary_message"]}"""\n\n'
         f"Channel context:\n\n"
         f'"""{context["previous_messages"]}"""\n\n'
-        "Respond clearly, confidently, and in a format that fits the request (lists, memos, letters, summaries, "
-        "newsletters, blogs, articles, and multi-paragraph write-ups and summaries). Prioritize completion."
+        "Respond clearly, confidently, and in a format that fits the request. Prioritize completion."
     )
 
 def generate_response(prompt, safe=True, max_retries=2):
