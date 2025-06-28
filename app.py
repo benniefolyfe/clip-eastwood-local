@@ -21,7 +21,6 @@ import sys
 import atexit
 import html
 import asana
-import requests
 import math
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -133,6 +132,7 @@ def init_db():
         # Enable Write-Ahead Logging (WAL) and Optimize PRAGMAs
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
+
         # Main messages table
         c.execute('''CREATE TABLE IF NOT EXISTS messages
         (ts TEXT PRIMARY KEY,
@@ -147,14 +147,16 @@ def init_db():
         permalink TEXT,
         is_bot BOOLEAN,
         deleted BOOLEAN DEFAULT FALSE)''')
+
         # Last seen timestamps per channel
         c.execute('''CREATE TABLE IF NOT EXISTS last_seen
         (channel_id TEXT PRIMARY KEY,
         last_ts TEXT)''')
+
         # Whether messages have been responded to
         c.execute('''CREATE TABLE IF NOT EXISTS responded_messages
         (ts TEXT PRIMARY KEY)''')
-        conn.commit()
+
         # Asana tasks
         c.execute('''CREATE TABLE IF NOT EXISTS asana_tasks (
         gid TEXT PRIMARY KEY,
@@ -166,6 +168,7 @@ def init_db():
         project_id TEXT,
         modified_at TEXT,
         custom_fields_json TEXT)''')
+
         # Asana projects
         c.execute('''CREATE TABLE IF NOT EXISTS asana_projects (
         gid TEXT PRIMARY KEY,
@@ -174,6 +177,16 @@ def init_db():
         created_at TEXT,
         modified_at TEXT,
         custom_fields_json TEXT)''')
+
+        # Asana custom field definitions
+        c.execute('''CREATE TABLE IF NOT EXISTS asana_custom_fields (
+        gid TEXT PRIMARY KEY,
+        name TEXT,
+        type TEXT,
+        enum_options_json TEXT)''')
+
+        # Commit after all tables are created
+        conn.commit()
 
 init_db()
 
@@ -228,6 +241,30 @@ def get_channel_and_thread_context(client, channel_id, limit=500, logger=None):
     
     return all_msgs[-limit:]  # Return most recent messages
 
+def format_custom_fields(custom_fields_json):
+    """Format custom fields JSON into a readable string, using field definitions."""
+    try:
+        fields = json.loads(custom_fields_json) if custom_fields_json else []
+        if not fields:
+            return ""
+        # Load custom field definitions from DB
+        with db_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT gid, name, type, enum_options_json FROM asana_custom_fields")
+            cf_defs = {row["gid"]: dict(row) for row in c.fetchall()}
+        lines = []
+        for field in fields:
+            gid = field.get("gid")
+            defn = cf_defs.get(gid, {})
+            name = defn.get("name", f"Field {gid}")
+            value = field.get("display_value") or field.get("text_value") or field.get("enum_value", {}).get("name") or field.get("number_value") or field.get("date_value") or ""
+            if value is None:
+                value = ""
+            lines.append(f"    - {name}: {value}")
+        return "\n".join(lines)
+    except Exception as e:
+        return ""
+
 def get_asana_context_blocks(keywords=None):
     with db_connection() as conn:
         c = conn.cursor()
@@ -244,6 +281,10 @@ def get_asana_context_blocks(keywords=None):
         clean_notes = re.sub(r'\s+', ' ', clean_notes).strip()
         if clean_notes:
             task_str += f"\n  Notes: {clean_notes[:1000]}..."
+        # Add custom fields for the task
+        custom_fields_str = format_custom_fields(task.get("custom_fields_json"))
+        if custom_fields_str:
+            task_str += f"\n  Custom Fields:\n{custom_fields_str}"
         project_tasks[project_id].append(task_str)
 
     # If keywords provided, filter projects
@@ -259,8 +300,11 @@ def get_asana_context_blocks(keywords=None):
         pid = project.get("gid")
         header = f"*Project: {project.get('name')}*\nLast Updated: {human_time(project.get('modified_at'))}"
         notes = f"Notes: {project.get('notes')[:1000]}." if project.get("notes") else ""
+        # Add custom fields for the project
+        custom_fields_str = format_custom_fields(project.get("custom_fields_json"))
+        custom_fields_block = f"\nCustom Fields:\n{custom_fields_str}" if custom_fields_str else ""
         tasks_formatted = "\n".join(project_tasks.get(pid, ["(No associated tasks found)"]))
-        block = f"{header}\n{notes}\n\nAssociated Tasks:\n{tasks_formatted}"
+        block = f"{header}\n{notes}{custom_fields_block}\n\nAssociated Tasks:\n{tasks_formatted}"
         formatted_blocks.append(block)
 
     if not formatted_blocks:
@@ -276,6 +320,24 @@ def sync_asana_data_once():
     try:
         workspaces_api = asana.WorkspacesApi(asana_api_client)
         workspace_gid = list(workspaces_api.get_workspaces({}))[0]['gid']
+
+        # Fetch all custom fields in the workspace
+        custom_fields_api = asana.CustomFieldsApi(asana_api_client)
+        custom_fields = custom_fields_api.get_custom_fields_for_workspace(workspace_gid, {})
+        with db_connection() as conn:
+            c = conn.cursor()
+            for cf in custom_fields:
+                c.execute('''
+                    INSERT OR REPLACE INTO asana_custom_fields
+                    (gid, name, type, enum_options_json)
+                    VALUES (?, ?, ?, ?)
+                ''', (
+                    cf.get("gid"),
+                    cf.get("name"),
+                    cf.get("type"),
+                    json.dumps(cf.get("enum_options", []))
+                ))
+            conn.commit()
 
         projects = projects_api.get_projects_for_workspace(
             workspace_gid,
@@ -406,6 +468,8 @@ def filter_search_messages(messages):
         filtered.append(msg)
     return filtered
 
+FAILED_DELETES = []
+
 def save_or_update_message(msg, channel_info, action="upsert", source="event"):
     """
     Insert, update, or mark a message as deleted in the database.
@@ -413,19 +477,36 @@ def save_or_update_message(msg, channel_info, action="upsert", source="event"):
     Args:
         msg (dict): Slack message dictionary (must include 'ts').
         channel_info (dict): Channel info dictionary (must include 'id').
-        action (str): "upsert" for insert/update, "delete" for soft-delete.
+        action (str): "upsert" for insert/update, "delete" for hard-delete.
         source (str): Event source, for logging/audit.
     """
     ts = msg.get('ts')
     channel_id = channel_info['id']
-    
+    max_retries = 5
+    retry_delay = 0.5  # seconds
+
     if action == "delete":
-        logger.info(f"[DEBUG] Attempting to mark message ts={ts} as deleted in channel={channel_id}.")
-        with db_connection() as conn:
-            c = conn.cursor()
-            c.execute('UPDATE messages SET deleted = 1 WHERE ts = ? AND channel_id = ?', (ts, channel_id))
-            conn.commit()
-        logger.info(f"[DB] Marked message ts={ts} in channel {channel_id} as deleted.")
+        logger.info(f"[DEBUG] Attempting to hard delete message ts={ts} from channel={channel_id}.")
+        for attempt in range(max_retries):
+            try:
+                with db_connection() as conn:
+                    c = conn.cursor()
+                    c.execute('DELETE FROM messages WHERE ts = ? AND channel_id = ?', (ts, channel_id))
+                    c.execute('DELETE FROM responded_messages WHERE ts = ?', (ts,))
+                    # Add more DELETEs for related tables if needed
+                    conn.commit()
+                logger.info(f"[DB] Hard deleted message ts={ts} from channel {channel_id} and related tables.")
+                break
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    logger.warning(f"[DB] Database is locked, retrying delete (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"[DB] Error during delete: {e}", exc_info=True)
+                    break
+        else:
+            logger.error(f"[DB] Failed to delete message ts={ts} after {max_retries} retries due to database lock.")
+            FAILED_DELETES.append((ts, channel_id))
         return
 
     # Upsert logic
@@ -612,6 +693,14 @@ def search_messages_local(terms, channel_id=None):
         logger.error(f"[DB] Search error: {e}", exc_info=True)
         return []
 
+def clear_all_history():
+    with db_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM messages")
+        c.execute("DELETE FROM last_seen")
+        conn.commit()
+    logger.info("[BACKFILL] Cleared all message and last_seen history for full backfill.")
+    
 def get_last_seen(channel_id):
     """Get last processed timestamp for a channel"""
     try:
@@ -652,7 +741,7 @@ def count_asana_projects_and_tasks():
     return projects, tasks
 
 def periodic_backfill(interval=BACKFILL_INTERVAL):
-    """Periodic backfill scheduler with auto-vacuum and null entry cleanup"""
+    """Periodic backfill scheduler with auto-vacuum, null entry cleanup, and retry of failed deletes."""
     while True:
         try:
             backfill_and_process_mentions()
@@ -666,6 +755,28 @@ def periodic_backfill(interval=BACKFILL_INTERVAL):
                 conn.commit()
                 logger.info("[BACKFILL] Removed NULL/empty text entries")
 
+            # Retry failed hard deletes
+            global FAILED_DELETES
+            if FAILED_DELETES:
+                logger.info(f"[BACKFILL] Retrying {len(FAILED_DELETES)} failed deletes...")
+            for ts, channel_id in FAILED_DELETES[:]:
+                try:
+                    with db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('DELETE FROM messages WHERE ts = ? AND channel_id = ?', (ts, channel_id))
+                        c.execute('DELETE FROM responded_messages WHERE ts = ?', (ts,))
+                        # Add more DELETEs for related tables if needed
+                        conn.commit()
+                    FAILED_DELETES.remove((ts, channel_id))
+                    logger.info(f"[BACKFILL] Successfully retried and hard deleted message ts={ts} from channel={channel_id} and related tables.")
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e):
+                        logger.warning(f"[BACKFILL] Database still locked for ts={ts}, channel={channel_id}. Will retry later.")
+                        continue
+                    else:
+                        logger.error(f"[BACKFILL] Error retrying delete for ts={ts}, channel={channel_id}: {e}", exc_info=True)
+                        continue
+
         except Exception as e:
             logger.error(f"[BACKFILL] Periodic backfill error: {e}", exc_info=True)
         
@@ -675,7 +786,15 @@ def backfill_and_process_mentions():
     """Backfill missed messages and process mentions (with pagination), skipping already logged messages."""
     try:
         logger.info("[BACKFILL] Starting backfill process")
-        channels = client.conversations_list(types="public_channel")["channels"]
+
+        # Determine if this is a fresh backfill by checking if any rows exist at all
+        with db_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM last_seen")
+            is_fresh_start = (c.fetchone()[0] == 0)
+        logger.info(f"[BACKFILL] Fresh backfill: {is_fresh_start}")
+
+        channels = client.conversations_list(types="public_channel")['channels']
 
         for channel in channels:
             channel_id = channel['id']
@@ -683,9 +802,17 @@ def backfill_and_process_mentions():
                 continue
 
             last_ts = get_last_seen(channel_id)
+            if not last_ts or last_ts in ('', '0'):
+                last_ts = '0'
+                is_fresh_start = True
+            else:
+                is_fresh_start = False
+
             logger.debug(f"[BACKFILL] Backfilling {channel['name']} from {last_ts}")
 
             cursor = None
+            latest_seen = last_ts
+
             while True:
                 response = client.conversations_history(
                     channel=channel_id,
@@ -699,58 +826,74 @@ def backfill_and_process_mentions():
                     if not ts:
                         continue
 
-                    # Skip bot join/system messages
+                    if not is_fresh_start and float(ts) <= float(last_ts):
+                        logger.debug(f"[BACKFILL] Skipping message ts={ts} (already seen, last_ts={last_ts})")
+                        continue
+
                     if "has joined the channel" in msg.get('text', '').lower():
                         continue
 
-                    # Skip if message is too old
-                    if is_message_too_old(ts):
+                    if not msg.get('text'):
+                        logger.debug(f"[BACKFILL] Skipping message ts={ts} due to empty or None text.")
                         continue
 
-                    # Skip if already responded
-                    if has_responded(ts):
-                        continue
-
-                    # Skip if already logged in DB
                     with db_connection() as conn:
                         c = conn.cursor()
                         c.execute("SELECT 1 FROM messages WHERE ts=? AND channel_id=?", (ts, channel_id))
                         if c.fetchone():
-                            logger.info(f"[BACKFILL] Skipping already-logged message ts={ts} in channel={channel_id}")
+                            logger.debug(f"[DEBUG] Already in DB: ts={ts} channel={channel_id}")
                             continue
 
-                    # Store message
+                    logger.info(f"[DEBUG] Logging NEW message ts={ts}")
                     store_message_with_check(msg, channel)
 
-                    # Check for mentions
+                    # Update last_seen after logging
+                    with db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('INSERT OR REPLACE INTO last_seen (channel_id, last_ts) VALUES (?, ?)', (channel_id, ts))
+                        conn.commit()
+
+                    latest_seen = ts
+
                     if f"<@{BOT_USER_ID}>" in msg.get('text', ''):
+                        logger.info(f"[MENTION] Found mention in backfill: ts={ts}")
                         log_mention(msg.get('user'), channel_id, msg.get('text'))
-                        handle_app_mention({
-                            'user': msg.get('user'),
-                            'channel': channel_id,
-                            'text': msg.get('text'),
-                            'ts': ts,
-                            'thread_ts': msg.get('thread_ts')
-                        }, lambda text, **kwargs: client.chat_postMessage(
-                            channel=channel_id,
-                            text=text,
-                            thread_ts=msg.get('thread_ts') if msg.get('thread_ts') else None
-                        ), client, logger
-                    )
+                        try:
+                            handle_app_mention({
+                                'user': msg.get('user'),
+                                'channel': channel_id,
+                                'text': msg.get('text'),
+                                'ts': ts,
+                                'thread_ts': msg.get('thread_ts')
+                            }, lambda text, **kwargs: client.chat_postMessage(
+                                channel=channel_id,
+                                text=text,
+                                thread_ts=msg.get('thread_ts') if msg.get('thread_ts') else None
+                            ), client, logger)
+                        except Exception as e:
+                            logger.warning(f"[MENTION] Failed to process mention during backfill: {e}")
+
                     mark_as_responded(ts)
 
                 cursor = response.get('response_metadata', {}).get('next_cursor')
                 if not cursor:
                     break
 
+            if latest_seen != last_ts:
+                with db_connection() as conn:
+                    c = conn.cursor()
+                    c.execute('INSERT OR REPLACE INTO last_seen (channel_id, last_ts) VALUES (?, ?)', (channel_id, latest_seen))
+                    conn.commit()
+
         logger.info("[BACKFILL] Backfill complete")
 
-        # Asana sync
         logger.info("[BACKFILL] Starting one-time Asana sync after backfill.")
         sync_asana_data_once()
 
     except Exception as e:
         logger.error(f"[BACKFILL] Critical error: {e}", exc_info=True)
+
+
 
 def get_reply_thread_ts(event):
     """
