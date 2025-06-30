@@ -486,7 +486,7 @@ def save_or_update_message(msg, channel_info, action="upsert", source="event"):
     retry_delay = 0.5  # seconds
 
     if action == "delete":
-        logger.info(f"[DEBUG] Attempting to hard delete message ts={ts} from channel={channel_id}.")
+        # logger.info(f"[DEBUG] Attempting to hard delete message ts={ts} from channel={channel_id}.")
         for attempt in range(max_retries):
             try:
                 with db_connection() as conn:
@@ -536,7 +536,7 @@ def save_or_update_message(msg, channel_info, action="upsert", source="event"):
                 WHERE ts = :ts AND channel_id = :channel_id
             ''', msg_data)
         else:
-            logger.info(f"[DEBUG] Attempting to upsert message ts={ts} in channel={channel_id}.")
+            # logger.info(f"[DEBUG] Attempting to upsert message ts={ts} in channel={channel_id}.")
             c.execute('''
                 INSERT INTO messages (
                     ts, text, user_id, username, channel_id, channel_name,
@@ -841,10 +841,10 @@ def backfill_and_process_mentions():
                         c = conn.cursor()
                         c.execute("SELECT 1 FROM messages WHERE ts=? AND channel_id=?", (ts, channel_id))
                         if c.fetchone():
-                            logger.debug(f"[DEBUG] Already in DB: ts={ts} channel={channel_id}")
+                            # logger.debug(f"[DEBUG] Already in DB: ts={ts} channel={channel_id}")
                             continue
 
-                    logger.info(f"[DEBUG] Logging NEW message ts={ts}")
+                    # logger.info(f"[DEBUG] Logging NEW message ts={ts}")
                     store_message_with_check(msg, channel)
 
                     # Update last_seen after logging

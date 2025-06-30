@@ -1,8 +1,8 @@
 /Archive
 /.env
-/.gitattributes
 /Clip Eastwood Unresolved Items.docx
 /*.db*
 /.DS_Store
 /Refactoring
 /.gitignore
+/.gitattributes
