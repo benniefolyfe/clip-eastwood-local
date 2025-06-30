@@ -6,5 +6,6 @@ ratelimit
 tenacity
 python-dotenv
 google-generativeai
+google-api-core
 certifi
 asana
