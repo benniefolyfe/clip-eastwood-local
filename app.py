@@ -1393,6 +1393,112 @@ def handle_dev_channels_delete_recent(ack, respond, command, client, logger):
         logger.error(f"Error deleting all dev messages: {e}", exc_info=True)
         respond("An error occurred while deleting messages.")
 
+@app.command("/dev-export-channel")
+def export_channel_messages(ack, respond, command, client, logger):
+    from slack_sdk.errors import SlackApiError
+    import json
+
+    ack()
+    channel_id = command["channel_id"]
+    user_id = command["user_id"]
+    respond(f"<@{user_id}> Starting export of all messages from <#{channel_id}>...")
+
+    def fetch_all_messages(channel_id):
+        messages = []
+        cursor = None
+        while True:
+            try:
+                resp = client.conversations_history(
+                    channel=channel_id,
+                    cursor=cursor,
+                    limit=200,
+                    inclusive=True
+                )
+                messages.extend(resp.get("messages", []))
+                cursor = resp.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
+            except SlackApiError as e:
+                logger.error(f"[EXPORT] Failed to fetch messages: {e}")
+                break
+        return list(reversed(messages))  # Oldest → Newest
+
+    def get_channel_info(channel_id):
+        try:
+            return client.conversations_info(channel=channel_id)['channel']
+        except Exception as e:
+            logger.error(f"[EXPORT] Failed to fetch channel info: {e}")
+            return {"id": channel_id, "name": "unknown"}
+
+    def assemble_message_data(msg, channel_info):
+        ts = msg.get('ts')
+        return {
+            'ts': ts,
+            'text': msg.get('text'),
+            'user_id': msg.get('user'),
+            'username': get_username(msg.get('user')) if msg.get('user') else 'Unknown User',
+            'channel_id': channel_info['id'],
+            'channel_name': channel_info.get('name') or 'unknown',
+            'thread_ts': msg.get('thread_ts'),
+            'reactions': json.dumps(msg.get('reactions', [])),
+            'attachments': json.dumps(msg.get('attachments', [])),
+            'permalink': safe_get_permalink(client, channel_info['id'], ts),
+            'is_bot': int('bot_id' in msg),
+            'deleted': 0
+        }
+
+    def is_duplicate(ts, channel_id, cursor):
+        cursor.execute("SELECT 1 FROM messages WHERE ts = ? AND channel_id = ?", (ts, channel_id))
+        return cursor.fetchone() is not None
+
+    def insert_into_db(message_data_list):
+        from sqlite3 import IntegrityError
+        with db_connection() as conn:
+            c = conn.cursor()
+            inserted = 0
+            for data in message_data_list:
+                if is_duplicate(data['ts'], data['channel_id'], c):
+                    continue
+                try:
+                    c.execute("""
+                        INSERT INTO messages (
+                            ts, text, user_id, username, channel_id, channel_name,
+                            thread_ts, reactions, attachments, permalink, is_bot, deleted
+                        ) VALUES (
+                            :ts, :text, :user_id, :username, :channel_id, :channel_name,
+                            :thread_ts, :reactions, :attachments, :permalink, :is_bot, :deleted
+                        )
+                    """, data)
+                    inserted += 1
+                except IntegrityError:
+                    continue
+            conn.commit()
+        return inserted
+
+    try:
+        messages = fetch_all_messages(channel_id)
+        channel_info = get_channel_info(channel_id)
+        msg_data = []
+
+        for msg in messages:
+            msg_data.append(assemble_message_data(msg, channel_info))
+
+            # Inline thread reply integration
+            if msg.get("reply_count", 0) > 0 and msg.get("ts"):
+                try:
+                    result = client.conversations_replies(channel=channel_id, ts=msg["ts"], limit=200)
+                    replies = result.get("messages", [])
+                    for reply in replies:
+                        if reply.get("ts") != msg["ts"]:  # avoid duplicating the parent
+                            msg_data.append(assemble_message_data(reply, channel_info))
+                except SlackApiError as e:
+                    logger.error(f"[THREAD_FETCH] Failed fetching replies for {msg['ts']}: {e}")
+        inserted_count = insert_into_db(msg_data)
+        respond(f"✅ Done! {inserted_count} new messages added from <#{channel_id}>.")
+    except Exception as e:
+        logger.error(f"[EXPORT] Failed: {e}", exc_info=True)
+        respond(f"❌ Export failed: {e}")
+
 @app.command("/ai-asana-query")
 def handle_asana_query_command(ack, respond, command, say, logger, client):
     ack()
