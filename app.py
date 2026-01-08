@@ -24,15 +24,11 @@ import asana
 import math
 from flask import Flask
 
-print("SLACK_BOT_TOKEN present:", bool(os.getenv("SLACK_BOT_TOKEN")))
-print("SLACK_APP_TOKEN present:", bool(os.getenv("SLACK_APP_TOKEN")))
-print("SLACK_SIGNING_SECRET present:", bool(os.getenv("SLACK_SIGNING_SECRET")))
-print("GEMINI_API_KEY present:", bool(os.getenv("GEMINI_API_KEY")))
-
 health_app = Flask(__name__)
 
 @health_app.route("/")
 def health_check():
+    start_background_once()
     return "OK", 200
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -73,6 +69,37 @@ BOT_PERSONALITY_PROMPT = (
 # Initialize Slack clients
 app = App(token=SLACK_BOT_TOKEN)
 client = WebClient(token=SLACK_BOT_TOKEN)
+
+_bg_lock = threading.Lock()
+_bg_started = False
+_socket_thread = None
+
+def _run_socket_mode():
+    logger.info("[STARTUP] Starting Slack Socket Mode")
+    SocketModeHandler(app, SLACK_APP_TOKEN).start()
+
+def _monitor_socket_thread():
+    while True:
+        time.sleep(5)
+        if _socket_thread and not _socket_thread.is_alive():
+            logger.error("[STARTUP] Socket Mode died — exiting for Cloud Run restart")
+            os._exit(1)
+
+def start_background_once():
+    global _bg_started, _socket_thread
+    with _bg_lock:
+        if _bg_started:
+            return
+        _bg_started = True
+
+        _socket_thread = threading.Thread(target=_run_socket_mode, daemon=True)
+        _socket_thread.start()
+
+        threading.Thread(target=_monitor_socket_thread, daemon=True).start()
+        threading.Thread(target=join_all_channels, daemon=True).start()
+        threading.Thread(target=periodic_backfill, daemon=True).start()
+
+        logger.info("[STARTUP] Background services started")
 
 def human_time(iso_str):
     try:
@@ -1994,23 +2021,3 @@ def remove_null_text_entries():
 
 # Global stop signal for background threads
 stop_event = threading.Event()
-
-def main():
-    atexit.register(lambda: print(" [EXIT] Interrupted by user."))
-
-    # Start Slack Socket Mode in background
-    threading.Thread(
-        target=lambda: SocketModeHandler(app, SLACK_APP_TOKEN).start(),
-        daemon=True
-    ).start()
-
-    # Background tasks
-    threading.Thread(target=join_all_channels, daemon=True).start()
-    threading.Thread(target=periodic_backfill, daemon=True).start()
-
-    # Block forever so container stays alive
-    while True:
-        time.sleep(60)
-
-if __name__ == "__main__":
-    main()
