@@ -1993,10 +1993,15 @@ stop_event = threading.Event()
 def main():
     atexit.register(lambda: print(" [EXIT] Interrupted by user."))
 
-    # --- START HTTP SERVER FOR CLOUD RUN ---
+    # --- START HTTP SERVER FOR CLOUD RUN (FIRST) ---
     port = int(os.environ.get("PORT", 8080))
     threading.Thread(
-        target=lambda: health_app.run(host="0.0.0.0", port=port),
+        target=lambda: health_app.run(
+            host="0.0.0.0",
+            port=port,
+            debug=False,
+            use_reloader=False
+        ),
         daemon=True
     ).start()
     # --- END HTTP SERVER ---
