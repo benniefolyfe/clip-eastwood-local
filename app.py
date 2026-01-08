@@ -22,6 +22,13 @@ import atexit
 import html
 import asana
 import math
+from flask import Flask
+
+health_app = Flask(__name__)
+
+@health_app.route("/")
+def health_check():
+    return "OK", 200
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 load_dotenv()
@@ -1984,24 +1991,31 @@ def remove_null_text_entries():
 stop_event = threading.Event()
 
 def main():
-    # Register cleanup FIRST
     atexit.register(lambda: print(" [EXIT] Interrupted by user."))
-    
+
+    # --- START HTTP SERVER FOR CLOUD RUN ---
+    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(
+        target=lambda: health_app.run(host="0.0.0.0", port=port),
+        daemon=True
+    ).start()
+    # --- END HTTP SERVER ---
+
     # Start Bolt app in non-daemon thread
     bolt_thread = threading.Thread(
         target=lambda: SocketModeHandler(app, SLACK_APP_TOKEN).start(),
         daemon=False
     )
     bolt_thread.start()
-    
-    # Start background tasks as daemon threads
+
+    # Background tasks
     threading.Thread(target=join_all_channels, daemon=True).start()
     threading.Thread(target=periodic_backfill, daemon=True).start()
 
     try:
-        bolt_thread.join()  # Block until Bolt exits
+        bolt_thread.join()
     except KeyboardInterrupt:
-        sys.exit(0)  # atexit handles cleanup
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
