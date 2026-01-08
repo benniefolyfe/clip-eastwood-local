@@ -1993,34 +1993,24 @@ stop_event = threading.Event()
 def main():
     atexit.register(lambda: print(" [EXIT] Interrupted by user."))
 
-    # --- START HTTP SERVER FOR CLOUD RUN (FIRST) ---
-    port = int(os.environ.get("PORT", 8080))
+    # Start Slack Socket Mode in background
     threading.Thread(
-        target=lambda: health_app.run(
-            host="0.0.0.0",
-            port=port,
-            debug=False,
-            use_reloader=False
-        ),
+        target=lambda: SocketModeHandler(app, SLACK_APP_TOKEN).start(),
         daemon=True
     ).start()
-    # --- END HTTP SERVER ---
-
-    # Start Bolt app in non-daemon thread
-    bolt_thread = threading.Thread(
-        target=lambda: SocketModeHandler(app, SLACK_APP_TOKEN).start(),
-        daemon=False
-    )
-    bolt_thread.start()
 
     # Background tasks
     threading.Thread(target=join_all_channels, daemon=True).start()
     threading.Thread(target=periodic_backfill, daemon=True).start()
 
-    try:
-        bolt_thread.join()
-    except KeyboardInterrupt:
-        sys.exit(0)
+    # --- THIS MUST BE THE MAIN THREAD ---
+    port = int(os.environ.get("PORT", 8080))
+    health_app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
 
 if __name__ == "__main__":
     main()
