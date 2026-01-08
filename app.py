@@ -24,6 +24,11 @@ import asana
 import math
 from flask import Flask
 
+print("SLACK_BOT_TOKEN present:", bool(os.getenv("SLACK_BOT_TOKEN")))
+print("SLACK_APP_TOKEN present:", bool(os.getenv("SLACK_APP_TOKEN")))
+print("SLACK_SIGNING_SECRET present:", bool(os.getenv("SLACK_SIGNING_SECRET")))
+print("GEMINI_API_KEY present:", bool(os.getenv("GEMINI_API_KEY")))
+
 health_app = Flask(__name__)
 
 @health_app.route("/")
