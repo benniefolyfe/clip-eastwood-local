@@ -2003,14 +2003,9 @@ def main():
     threading.Thread(target=join_all_channels, daemon=True).start()
     threading.Thread(target=periodic_backfill, daemon=True).start()
 
-    # --- THIS MUST BE THE MAIN THREAD ---
-    port = int(os.environ.get("PORT", 8080))
-    health_app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
-    )
+    # Block forever so container stays alive
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
