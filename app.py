@@ -1,7 +1,7 @@
 import os
 import logging
 from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_bolt.adapter.flask import SlackRequestHandler
 import certifi
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
@@ -22,14 +22,9 @@ import atexit
 import html
 import asana
 import math
-from flask import Flask
+from flask import Flask, request
 
-health_app = Flask(__name__)
-
-@health_app.route("/")
-def health_check():
-    start_background_once()
-    return "OK", 200
+flask_app = Flask(__name__)
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 load_dotenv()
@@ -37,7 +32,6 @@ load_dotenv()
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
 ASANA_TOKEN = os.getenv("ASANA_TOKEN")
 
 # Asana configuration
@@ -67,39 +61,33 @@ BOT_PERSONALITY_PROMPT = (
 )
 
 # Initialize Slack clients
-app = App(token=SLACK_BOT_TOKEN)
+app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 client = WebClient(token=SLACK_BOT_TOKEN)
+handler = SlackRequestHandler(app)
 
 _bg_lock = threading.Lock()
 _bg_started = False
-_socket_thread = None
-
-def _run_socket_mode():
-    logger.info("[STARTUP] Starting Slack Socket Mode")
-    SocketModeHandler(app, SLACK_APP_TOKEN).start()
-
-def _monitor_socket_thread():
-    while True:
-        time.sleep(5)
-        if _socket_thread and not _socket_thread.is_alive():
-            logger.error("[STARTUP] Socket Mode died — exiting for Cloud Run restart")
-            os._exit(1)
-
 def start_background_once():
-    global _bg_started, _socket_thread
+    global _bg_started
     with _bg_lock:
         if _bg_started:
             return
         _bg_started = True
 
-        _socket_thread = threading.Thread(target=_run_socket_mode, daemon=True)
-        _socket_thread.start()
-
-        threading.Thread(target=_monitor_socket_thread, daemon=True).start()
         threading.Thread(target=join_all_channels, daemon=True).start()
         threading.Thread(target=periodic_backfill, daemon=True).start()
 
         logger.info("[STARTUP] Background services started")
+
+@flask_app.route("/")
+def health_check():
+    start_background_once()
+    return "OK", 200
+
+@flask_app.route("/slack/events", methods=["POST"])
+def slack_events():
+    start_background_once()
+    return handler.handle(request)
 
 def human_time(iso_str):
     try:
