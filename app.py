@@ -95,16 +95,26 @@ def human_time(iso_str):
     except Exception:
         return iso_str or "N/A"
 
-# Cache the bot's user ID once
-try:
-    BOT_USER_ID = client.auth_test()['user_id']
-except Exception as e:
-    logging.error(f"Failed to fetch bot user ID: {e}")
-    BOT_USER_ID = None
+_bot_user_id = None
+_bot_user_id_lock = threading.Lock()
+
+def get_bot_user_id():
+    global _bot_user_id
+    if _bot_user_id is not None:
+        return _bot_user_id
+    with _bot_user_id_lock:
+        if _bot_user_id is not None:
+            return _bot_user_id
+        try:
+            _bot_user_id = client.auth_test().get('user_id')
+        except Exception as e:
+            logging.error(f"Failed to fetch bot user ID: {e}")
+            _bot_user_id = None
+        return _bot_user_id
 
 def safe_user_reference(user_id, fallback="partner"):
     """Return a Slack mention unless it's the bot itself."""
-    if user_id == BOT_USER_ID:
+    if user_id == get_bot_user_id():
         return fallback
     return f"<@{user_id}>"
 
@@ -433,6 +443,9 @@ def get_channel_name(channel_id):
         lambda cid: client.conversations_info(channel=cid)['channel']
     )
 
+_mention_map = None
+_mention_map_lock = threading.Lock()
+
 def build_mention_map():
     mention_map = {}
     users = client.users_list()["members"]
@@ -455,6 +468,20 @@ def build_mention_map():
             mention_map[display_name] = user["id"]
 
     return mention_map
+
+def get_mention_map():
+    global _mention_map
+    if _mention_map is not None:
+        return _mention_map
+    with _mention_map_lock:
+        if _mention_map is not None:
+            return _mention_map
+        try:
+            _mention_map = build_mention_map()
+        except Exception as e:
+            logger.error(f"Failed to build mention map: {e}", exc_info=True)
+            _mention_map = {}
+        return _mention_map
 
 def assemble_message_data(msg, channel_info):
     """Build a dict with all message fields for DB upsert/insert."""
@@ -638,18 +665,21 @@ def inject_mentions(text):
             return replacement
         return re.sub(pattern, replacer, text)
 
+    mention_map = get_mention_map()
+    bot_user_id = get_bot_user_id()
+
     # Step 1: Replace user IDs
-    for user_id in set(MENTION_MAP.values()):
-        if user_id == BOT_USER_ID:
+    for user_id in set(mention_map.values()):
+        if user_id == bot_user_id:
             continue  # Skip the bot itself
         pattern = r'(?<!<@)' + re.escape(user_id) + r'(?!>)'
         replacement = f'<@{user_id}>'
         text = safe_replace(pattern, replacement, text)
 
     # Step 2: Replace names
-    for name in sorted(MENTION_MAP, key=len, reverse=True):
-        user_id = MENTION_MAP[name]
-        if user_id == BOT_USER_ID:
+    for name in sorted(mention_map, key=len, reverse=True):
+        user_id = mention_map[name]
+        if user_id == bot_user_id:
             continue  # Skip the bot itself
         pattern = r'\b' + re.escape(name) + r'\b'
         replacement = f'<@{user_id}>'
@@ -1936,7 +1966,6 @@ def format_for_slack(text, do_inject_mentions=True):
 
     return text.strip()
 
-MENTION_MAP = build_mention_map()
 
 def format_message_for_context(msg):
     """
