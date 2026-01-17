@@ -1,7 +1,7 @@
 import os
 import logging
 from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_bolt.adapter.flask import SlackRequestHandler
 import certifi
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
@@ -22,14 +22,9 @@ import atexit
 import html
 import asana
 import math
-from flask import Flask
+from flask import Flask, request
 
-health_app = Flask(__name__)
-
-@health_app.route("/")
-def health_check():
-    start_background_once()
-    return "OK", 200
+flask_app = Flask(__name__)
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 load_dotenv()
@@ -37,7 +32,6 @@ load_dotenv()
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
 ASANA_TOKEN = os.getenv("ASANA_TOKEN")
 
 # Asana configuration
@@ -67,39 +61,33 @@ BOT_PERSONALITY_PROMPT = (
 )
 
 # Initialize Slack clients
-app = App(token=SLACK_BOT_TOKEN)
+app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 client = WebClient(token=SLACK_BOT_TOKEN)
+handler = SlackRequestHandler(app)
 
 _bg_lock = threading.Lock()
 _bg_started = False
-_socket_thread = None
-
-def _run_socket_mode():
-    logger.info("[STARTUP] Starting Slack Socket Mode")
-    SocketModeHandler(app, SLACK_APP_TOKEN).start()
-
-def _monitor_socket_thread():
-    while True:
-        time.sleep(5)
-        if _socket_thread and not _socket_thread.is_alive():
-            logger.error("[STARTUP] Socket Mode died — exiting for Cloud Run restart")
-            os._exit(1)
-
 def start_background_once():
-    global _bg_started, _socket_thread
+    global _bg_started
     with _bg_lock:
         if _bg_started:
             return
         _bg_started = True
 
-        _socket_thread = threading.Thread(target=_run_socket_mode, daemon=True)
-        _socket_thread.start()
-
-        threading.Thread(target=_monitor_socket_thread, daemon=True).start()
         threading.Thread(target=join_all_channels, daemon=True).start()
         threading.Thread(target=periodic_backfill, daemon=True).start()
 
         logger.info("[STARTUP] Background services started")
+
+@flask_app.route("/")
+def health_check():
+    start_background_once()
+    return "OK", 200
+
+@flask_app.route("/slack/events", methods=["POST"])
+def slack_events():
+    start_background_once()
+    return handler.handle(request)
 
 def human_time(iso_str):
     try:
@@ -107,16 +95,26 @@ def human_time(iso_str):
     except Exception:
         return iso_str or "N/A"
 
-# Cache the bot's user ID once
-try:
-    BOT_USER_ID = client.auth_test()['user_id']
-except Exception as e:
-    logging.error(f"Failed to fetch bot user ID: {e}")
-    BOT_USER_ID = None
+_bot_user_id = None
+_bot_user_id_lock = threading.Lock()
+
+def get_bot_user_id():
+    global _bot_user_id
+    if _bot_user_id is not None:
+        return _bot_user_id
+    with _bot_user_id_lock:
+        if _bot_user_id is not None:
+            return _bot_user_id
+        try:
+            _bot_user_id = client.auth_test().get('user_id')
+        except Exception as e:
+            logging.error(f"Failed to fetch bot user ID: {e}")
+            _bot_user_id = None
+        return _bot_user_id
 
 def safe_user_reference(user_id, fallback="partner"):
     """Return a Slack mention unless it's the bot itself."""
-    if user_id == BOT_USER_ID:
+    if user_id == get_bot_user_id():
         return fallback
     return f"<@{user_id}>"
 
@@ -445,6 +443,9 @@ def get_channel_name(channel_id):
         lambda cid: client.conversations_info(channel=cid)['channel']
     )
 
+_mention_map = None
+_mention_map_lock = threading.Lock()
+
 def build_mention_map():
     mention_map = {}
     users = client.users_list()["members"]
@@ -467,6 +468,20 @@ def build_mention_map():
             mention_map[display_name] = user["id"]
 
     return mention_map
+
+def get_mention_map():
+    global _mention_map
+    if _mention_map is not None:
+        return _mention_map
+    with _mention_map_lock:
+        if _mention_map is not None:
+            return _mention_map
+        try:
+            _mention_map = build_mention_map()
+        except Exception as e:
+            logger.error(f"Failed to build mention map: {e}", exc_info=True)
+            _mention_map = {}
+        return _mention_map
 
 def assemble_message_data(msg, channel_info):
     """Build a dict with all message fields for DB upsert/insert."""
@@ -650,18 +665,21 @@ def inject_mentions(text):
             return replacement
         return re.sub(pattern, replacer, text)
 
+    mention_map = get_mention_map()
+    bot_user_id = get_bot_user_id()
+
     # Step 1: Replace user IDs
-    for user_id in set(MENTION_MAP.values()):
-        if user_id == BOT_USER_ID:
+    for user_id in set(mention_map.values()):
+        if user_id == bot_user_id:
             continue  # Skip the bot itself
         pattern = r'(?<!<@)' + re.escape(user_id) + r'(?!>)'
         replacement = f'<@{user_id}>'
         text = safe_replace(pattern, replacement, text)
 
     # Step 2: Replace names
-    for name in sorted(MENTION_MAP, key=len, reverse=True):
-        user_id = MENTION_MAP[name]
-        if user_id == BOT_USER_ID:
+    for name in sorted(mention_map, key=len, reverse=True):
+        user_id = mention_map[name]
+        if user_id == bot_user_id:
             continue  # Skip the bot itself
         pattern = r'\b' + re.escape(name) + r'\b'
         replacement = f'<@{user_id}>'
@@ -1948,7 +1966,6 @@ def format_for_slack(text, do_inject_mentions=True):
 
     return text.strip()
 
-MENTION_MAP = build_mention_map()
 
 def format_message_for_context(msg):
     """
